@@ -1,20 +1,17 @@
 # services/analyzer.py
-from google import genai
-from google.genai import types
 import json
 import re
+import time
 from typing import Optional
 from pydantic import BaseModel
 from enum import Enum
+from groq import Groq
 from ..core.config import settings
 from ..services.vector_store import find_similar_standard_clause
-import time
 
-# Configure Gemini with new SDK
-client = genai.Client(api_key=settings.gemini_api_key)
-MODEL = "gemini-2.0-flash"
-
-# ─── OUTPUT SCHEMA ───
+# Initialize Groq client
+client = Groq(api_key=settings.groq_api_key)
+MODEL = "llama-3.1-8b-instant"
 
 class RiskLevel(str, Enum):
     SAFE    = "safe"
@@ -24,14 +21,14 @@ class RiskLevel(str, Enum):
 
 class ClauseAnalysis(BaseModel):
     clause_index: int
-    clause_number: Optional[str]
-    clause_heading: Optional[str]
+    clause_number: Optional[str] = None
+    clause_heading: Optional[str] = None
     clause_type: str
     risk_level: RiskLevel
     risk_reasoning: str
     plain_english: str
-    negotiation_suggestion: Optional[str]
-    similar_standard_clause: Optional[str]
+    negotiation_suggestion: Optional[str] = None
+    similar_standard_clause: Optional[str] = None
     word_count: int
 
 
@@ -45,8 +42,7 @@ class ContractReport(BaseModel):
     clauses: list[ClauseAnalysis]
 
 
-ANALYSIS_PROMPT = """
-You are a senior contract lawyer analyzing a legal clause for risk.
+ANALYSIS_PROMPT = """You are a senior contract lawyer analyzing a legal clause for risk.
 
 CLAUSE TO ANALYZE:
 {clause_text}
@@ -54,25 +50,20 @@ CLAUSE TO ANALYZE:
 SIMILAR STANDARD CLAUSE FOR REFERENCE:
 {standard_clause}
 
-Analyze this clause and respond with ONLY a valid JSON object.
-No explanation before or after. Just the JSON.
+Respond with ONLY a valid JSON object. No explanation before or after. Just JSON.
 
-JSON format:
 {{
   "clause_type": "one of: payment, termination, confidentiality, liability, dispute_resolution, intellectual_property, security_deposit, force_majeure, governing_law, employment, general, other",
   "risk_level": "one of: safe, caution, risky",
   "risk_reasoning": "one clear sentence explaining WHY this risk level was assigned",
-  "plain_english": "explain this clause in simple English a non-lawyer would understand, max 2 sentences",
-  "negotiation_suggestion": "one specific thing to negotiate or null if clause is safe"
+  "plain_english": "explain this clause in simple English, max 2 sentences",
+  "negotiation_suggestion": "one specific negotiation point or null if safe"
 }}
 
-Risk level guidelines:
-- safe: standard clause, protects both parties fairly
+Risk levels:
+- safe: standard clause, fair to both parties
 - caution: slightly one-sided or missing standard protections
-- risky: heavily one-sided, missing critical protections, or contains unusual terms
-
-Be specific. Reference actual text from the clause in your reasoning.
-"""
+- risky: heavily one-sided or missing critical protections"""
 
 
 def analyze_clause(
@@ -83,7 +74,7 @@ def analyze_clause(
     word_count: int = 0
 ) -> ClauseAnalysis:
 
-    # Step 1: RAG retrieval
+    # RAG retrieval
     similar = find_similar_standard_clause(clause_text, n_results=1)
     standard_clause_text = "No similar standard clause found."
     similar_clause_label = None
@@ -98,20 +89,19 @@ def analyze_clause(
                 f"(similarity: {top_match['similarity_score']})"
             )
 
-    # Step 2: Build prompt
     prompt = ANALYSIS_PROMPT.format(
         clause_text=clause_text[:2000],
         standard_clause=standard_clause_text
     )
 
-    # Step 3: Call Gemini
     try:
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL,
-            contents=prompt
-            )
-        raw_text = response.text.strip()
-        # Step 4: Parse response
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=500
+        )
+        raw_text = response.choices[0].message.content.strip()
         parsed = _parse_ai_response(raw_text)
 
         return ClauseAnalysis(
@@ -229,48 +219,9 @@ def analyze_contract(clauses: list) -> ContractReport:
         )
         analyses.append(analysis)
 
-    risky_count   = sum(1 for a in analyses if a.risk_level == RiskLevel.RISKY)
-    caution_count = sum(1 for a in analyses if a.risk_level == RiskLevel.CAUTION)
-    safe_count    = sum(1 for a in analyses if a.risk_level == RiskLevel.SAFE)
-
-    score, label = calculate_risk_score(analyses)
-
-    print(f"✅ Analysis complete: {risky_count} risky, {caution_count} caution, {safe_count} safe")
-    print(f"   Overall risk: {label} ({score})")
-
-    return ContractReport(
-        total_clauses=len(analyses),
-        risky_count=risky_count,
-        caution_count=caution_count,
-        safe_count=safe_count,
-        overall_risk_score=score,
-        overall_risk_label=label,
-        clauses=analyses
-    )
-
-
-
-def analyze_contract(clauses: list) -> ContractReport:
-    print(f"🔄 Analyzing {len(clauses)} clauses...")
-
-    analyses = []
-    for clause in clauses:
-        print(f"  → Analyzing clause {clause.index + 1}/{len(clauses)}")
-        
-        analysis = analyze_clause(
-            clause_text=clause.text,
-            clause_index=clause.index,
-            clause_number=clause.number,
-            clause_heading=clause.heading,
-            word_count=clause.word_count
-        )
-        analyses.append(analysis)
-        
-        # Rate limiting — wait 4 seconds between each API call
-        # Gemini free tier = 15 requests/minute = 1 per 4 seconds
-        # This keeps us safely under the limit
-        if clause.index < len(clauses) - 1:  # Don't wait after last clause
-            time.sleep(4)
+        # Groq free tier = 30 req/min = 1 per 2 seconds
+        if clause.index < len(clauses) - 1:
+            time.sleep(2)
 
     risky_count   = sum(1 for a in analyses if a.risk_level == RiskLevel.RISKY)
     caution_count = sum(1 for a in analyses if a.risk_level == RiskLevel.CAUTION)
