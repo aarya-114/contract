@@ -1,11 +1,14 @@
 # routers/analyze.py
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from rich.diagnose import report
 from ..services.pdf_parser import parse_pdf, find_clause_locations
 from ..services.segmenter import segment_contract
 from ..services.vector_store import store_contract_clauses
 from ..services.analyzer import analyze_contract
 from ..core.redis_client import store_pdf
+from fastapi.responses import StreamingResponse
+import asyncio
 
 router = APIRouter(prefix="/analyze", tags=["analyze"])
 
@@ -72,3 +75,55 @@ async def analyze_contract_endpoint(file: UploadFile = File(...)):
         "highlights": highlights,
         **report.dict()
     }
+
+@router.post("/stream")
+async def analyze_stream(file: UploadFile = File(...)):
+    """
+    Same as /analyze but streams progress updates.
+    Frontend shows real-time clause-by-clause progress.
+    """
+    async def generate():
+        # Parse
+        yield f"data: {json.dumps({'status': 'parsing', 'message': 'Reading PDF...'})}\n\n"
+        
+        file_bytes = await file.read()
+        parse_result = parse_pdf(file_bytes)
+        
+        if not parse_result.is_valid:
+            yield f"data: {json.dumps({'status': 'error', 'message': parse_result.warning})}\n\n"
+            return
+
+        # Segment
+        yield f"data: {json.dumps({'status': 'segmenting', 'message': 'Extracting clauses...'})}\n\n"
+        clauses = segment_contract(parse_result.text)
+        yield f"data: {json.dumps({'status': 'segmented', 'message': f'Found {len(clauses)} clauses'})}\n\n"
+
+        # Store
+        session_id = str(uuid.uuid4())
+        store_pdf(file_bytes, session_id)
+        store_contract_clauses(clauses)
+
+        # Analyze clause by clause with progress
+        analyses = []
+        for clause in clauses:
+            yield f"data: {json.dumps({'status': 'analyzing', 'current': clause.index + 1, 'total': len(clauses), 'message': f'Analyzing clause {clause.index + 1} of {len(clauses)}...'})}\n\n"
+            
+            analysis = analyze_clause(
+                clause_text=clause.text,
+                clause_index=clause.index,
+                clause_number=clause.number,
+                clause_heading=clause.heading,
+                word_count=clause.word_count
+            )
+            analyses.append(analysis)
+            
+            if clause.index < len(clauses) - 1:
+                await asyncio.sleep(2)
+
+        # Build report
+        yield f"data: {json.dumps({'status': 'finishing', 'message': 'Building report...'})}\n\n"
+        
+        # ... rest of report building
+        yield f"data: {json.dumps({'status': 'done', 'report': report.dict()})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
